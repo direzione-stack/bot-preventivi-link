@@ -20,7 +20,7 @@ creds = service_account.Credentials.from_service_account_info(GOOGLE_CREDENTIALS
 drive_service = build('drive', 'v3', credentials=creds)
 
 MAIN_FOLDER_NAME = "PreventiviTelegram"
-CHECK_INTERVAL = 60  # ogni 60 secondi
+CHECK_INTERVAL = 60
 SOLLECITI_ORE = [4, 8, 24, 48]
 STATO_FILE = "stato.json"
 
@@ -124,11 +124,26 @@ def gestore_messaggi(update: Update, context: CallbackContext):
                 bot.send_message(chat_id=chat_id, text=f"✅ Confermato: {stato_preventivi[key]['nome']}")
                 bot.send_message(chat_id=OWNER_ID, text=f"✅ Confermato da gruppo {chat_id}: {stato_preventivi[key]['nome']}")
 
+def gestisci_migrazione(update: Update, context: CallbackContext):
+    if update.message and update.message.migrate_to_chat_id:
+        old_id = update.message.chat.id
+        new_id = update.message.migrate_to_chat_id
+        bot.send_message(chat_id=new_id, text="✅ Gruppo migrato a supergruppo. ID aggiornato automaticamente.")
+        nuove_chiavi = {}
+        for key in list(stato_preventivi):
+            if str(old_id) in key:
+                nuovo_key = key.replace(str(old_id), str(new_id))
+                stato = stato_preventivi.pop(key)
+                stato["chat_id"] = new_id
+                nuove_chiavi[nuovo_key] = stato
+        stato_preventivi.update(nuove_chiavi)
+
 dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, gestore_messaggi))
+dispatcher.add_handler(MessageHandler(Filters.status_update.migrate, gestisci_migrazione))
 
 if __name__ == "__main__":
     updater.start_polling()
-    print("🤖 Bot avviato con solleciti + salvataggio JSON...")
+    print("🤖 Bot autoreattivo avviato...")
     while True:
         try:
             esegui_scansione()
