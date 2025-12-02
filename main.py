@@ -1,87 +1,100 @@
 import os
-import json
 import time
-import logging
-from telegram import Bot, Update
-from telegram.ext import Updater, MessageHandler, Filters, CallbackContext
+import json
+import threading
+from datetime import datetime, timedelta
+from telegram import Bot
+from telegram.error import TelegramError
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from scheduler import avvia_solleciti, current_states
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GOOGLE_CREDS = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+# === CONFIG ===
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GOOGLE_CREDS_JSON = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+FOLDER_NAME = "PreventiviTelegram"
+SOLLECITO_DELAY = 4 * 60 * 60  # 4 ore in secondi
 
 bot = Bot(token=BOT_TOKEN)
-updater = Updater(token=BOT_TOKEN, use_context=True)
-dispatcher = updater.dispatcher
 
-credentials = service_account.Credentials.from_service_account_info(
-    GOOGLE_CREDS, scopes=["https://www.googleapis.com/auth/drive"]
-)
-drive_service = build("drive", "v3", credentials=credentials)
+# === GOOGLE DRIVE ===
+SCOPES = ['https://www.googleapis.com/auth/drive']
+creds = service_account.Credentials.from_service_account_info(GOOGLE_CREDS_JSON, scopes=SCOPES)
+drive_service = build('drive', 'v3', credentials=creds)
 
-def lista_cartelle_gruppo():
-    res = drive_service.files().list(
-        q=f"'{DRIVE_FOLDER_ID}' in parents and mimeType = 'application/vnd.google-apps.folder'",
-        fields="files(id, name)"
-    ).execute()
-    return res.get("files", [])
+# === TRACKING ===
+processed_folders = {}
+solleciti = {}
 
-def lista_cartelle_preventivo(group_id):
-    res = drive_service.files().list(
-        q=f"'{group_id}' in parents and mimeType = 'application/vnd.google-apps.folder'",
-        fields="files(id, name)"
-    ).execute()
-    return res.get("files", [])
-    def invia_preventivo(chat_id, nome, folder_id):
-    link = f"https://drive.google.com/drive/folders/{folder_id}"
-    msg = f"📂 Nuovo preventivo da confermare: *{nome}*\n🔗 {link}"
-    bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+# === FUNZIONI ===
+def get_subfolders(folder_id):
+    query = f"'{folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    response = drive_service.files().list(q=query, fields="files(id, name)").execute()
+    return response.get('files', [])
 
-def monitora():
+def get_folder_link(folder_id):
+    return f"https://drive.google.com/drive/folders/{folder_id}"
+
+def find_main_folder():
+    query = f"name = '{FOLDER_NAME}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    response = drive_service.files().list(q=query, fields="files(id)").execute()
+    files = response.get('files', [])
+    return files[0]['id'] if files else None
+
+def monitor_group_folder(group_folder_id, chat_id):
+    global processed_folders, solleciti
     while True:
-        gruppi = lista_cartelle_gruppo()
-        for gruppo in gruppi:
-            try:
-                chat_id = int(gruppo['name'].replace("gruppo_", ""))
-                sottocartelle = lista_cartelle_preventivo(gruppo['id'])
-                for cartella in sottocartelle:
-                    nome = cartella['name']
-                    if chat_id not in current_states:
-                        current_states[chat_id] = {}
-                    if nome not in current_states[chat_id]:
-                        current_states[chat_id][nome] = {
-                            "confermato": False,
-                            "timestamp": time.time(),
-                            "id": cartella['id']
-                        }
-                        invia_preventivo(chat_id, nome, cartella['id'])
-            except Exception as e:
-                logger.warning(f"Errore nel gruppo {gruppo['name']}: {e}")
+        try:
+            subfolders = get_subfolders(group_folder_id)
+            for folder in subfolders:
+                folder_id = folder['id']
+                folder_name = folder['name']
+
+                if folder_id not in processed_folders:
+                    link = get_folder_link(folder_id)
+                    message = f"📂 Nuova cartella caricata: *{folder_name}*\n🔗 {link}"
+                    bot.send_message(chat_id=chat_id, text=message, parse_mode='Markdown')
+                    processed_folders[folder_id] = {'sent': True, 'time': datetime.now(), 'chat_id': chat_id, 'name': folder_name, 'link': link}
+        except TelegramError as te:
+            print(f"Errore Telegram: {te}")
+        except Exception as e:
+            print(f"Errore nel monitoraggio cartelle: {e}")
+
+        time.sleep(30)
+
+def monitor_solleciti():
+    while True:
+        now = datetime.now()
+        for folder_id, info in processed_folders.items():
+            if 'reminded' not in info:
+                elapsed = (now - info['time']).total_seconds()
+                if elapsed > SOLLECITO_DELAY:
+                    msg = f"🔔 *Sollecito*: Attendi ancora conferma per la cartella *{info['name']}*.\n🔗 {info['link']}"
+                    try:
+                        bot.send_message(chat_id=info['chat_id'], text=msg, parse_mode='Markdown')
+                        info['reminded'] = True
+                    except TelegramError as te:
+                        print(f"Errore sollecito Telegram: {te}")
         time.sleep(60)
-        def gestisci_risposta(update: Update, context: CallbackContext):
-    chat_id = update.effective_chat.id
-    text = update.message.text.lower()
-    parole_conferma = ["ok", "confermo", "va bene", "ricevuto"]
 
-    if chat_id in current_states:
-        for nome, stato in current_states[chat_id].items():
-            if not stato["confermato"]:
-                if any(p in text for p in parole_conferma):
-                    current_states[chat_id][nome]["confermato"] = True
-                    bot.send_message(chat_id=chat_id, text=f"✅ Confermato: {nome}")
-                    bot.send_message(chat_id=OWNER_ID, text=f"✅ Il gruppo {chat_id} ha confermato il preventivo: {nome}")
+# === AVVIO ===
+main_folder_id = find_main_folder()
+if not main_folder_id:
+    raise Exception("Cartella 'PreventiviTelegram' non trovata su Google Drive")
 
-# Gestione messaggi di testo
-dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, gestisci_risposta))
+response = drive_service.files().list(q=f"'{main_folder_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false", fields="files(id, name)").execute()
+group_folders = response.get('files', [])
 
-if __name__ == '__main__':
-    logger.info("🤖 Bot avviato. In ascolto...")
-    avvia_solleciti(bot, OWNER_ID)
-    updater.start_polling()
-    monitora()
+print("✅ Bot avviato. Monitoraggio attivo sulle cartelle gruppi:")
+for folder in group_folders:
+    folder_id = folder['id']
+    folder_name = folder['name']
+    if folder_name.startswith("gruppo_"):
+        chat_id = folder_name.replace("gruppo_", "")
+        print(f"- {folder_name} (chat_id: {chat_id})")
+        t = threading.Thread(target=monitor_group_folder, args=(folder_id, int(chat_id)))
+        t.start()
+
+# Thread separato per solleciti
+t_solleciti = threading.Thread(target=monitor_solleciti)
+t_solleciti.start()
