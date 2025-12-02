@@ -1,81 +1,86 @@
-import logging
 import os
 import time
+import logging
 import gspread
-from datetime import datetime
+from datetime import datetime, timedelta
+from telegram import Bot
+from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
-from telegram import Bot, ParseMode
-from telegram.error import TelegramError
 
-# Imposta logging
+# Carica variabili ambiente
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Imposta credenziali Google Drive
-GOOGLE_CREDS = os.getenv("GOOGLE_CREDENTIALS")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
-OWNER_ID = int(os.getenv("OWNER_ID"))
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Setup bot
+bot = Bot(token=BOT_TOKEN)
 
-if not all([GOOGLE_CREDS, SPREADSHEET_ID, BOT_TOKEN]):
-    logger.error("Missing required environment variables.")
-    exit(1)
+# Setup Google Sheets API
+google_creds = os.getenv("GOOGLE_CREDENTIALS")
+if not google_creds:
+    raise Exception("Google credentials not found")
 
-creds = Credentials.from_service_account_info(eval(GOOGLE_CREDS))
+import json
+creds_dict = json.loads(google_creds)
+scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
 gspread_client = gspread.authorize(creds)
 sheet = gspread_client.open_by_key(SPREADSHEET_ID).sheet1
 
-bot = Bot(token=BOT_TOKEN)
+# Constants
+SOLLECITO_INTERVAL = timedelta(hours=5)
+FINE_SOLLECITI = timedelta(hours=48)
+SOLLECITO_MASSIMO = 9
+MESSAGGIO_FINE = "Ci dispiace il lavoro sarà dato ad un altro nostro partner"
 
-def read_sheet():
-    try:
-        return sheet.get_all_records()
-    except Exception as e:
-        logger.error(f"Errore nel leggere il foglio: {e}")
-        return []
+# Funzione di parsing della data
+def parse_datetime(data_str, ora_str):
+    return datetime.strptime(f"{data_str} {ora_str}", "%d/%m/%Y %H:%M")
 
-def send_reminder(row):
-    try:
-        group_id = int(row['chat_id'])
-        message = row['messaggio_da_inviare']
-        if message:
-            bot.send_message(chat_id=group_id, text=message, parse_mode=ParseMode.HTML)
-            logger.info(f"Messaggio inviato al gruppo {group_id}")
-    except TelegramError as e:
-        logger.error(f"Errore Telegram: {e}")
-    except Exception as e:
-        logger.error(f"Errore generico nell'invio: {e}")
+# Main loop
+def invia_messaggi():
+    rows = sheet.get_all_records()
+    now = datetime.now()
+    aggiornamenti = []
 
-def update_sent_flag(index):
-    try:
-        sheet.update_cell(index + 2, 5, "SI")
-    except Exception as e:
-        logger.warning(f"Errore aggiornamento flag su riga {index+2}: {e}")
+    for i, row in enumerate(rows, start=2):  # Riga 2 = prima riga dati
+        chat_id = row['chat_id']
+        messaggio = row['messaggio_da_inviare']
+        data = row['data']
+        ora = row['ora']
+        inviato = row.get('inviato', '')
 
-def check_and_send():
-    logger.info("Controllo nuovi messaggi da inviare...")
-    rows = read_sheet()
-    now = datetime.now().strftime("%d/%m/%Y %H:%M")
-    for i, row in enumerate(rows):
-        if row.get("inviato", "") != "SI":
-            data = row.get("data")
-            ora = row.get("ora")
-            if not data or not ora:
-                continue
-            scheduled_time = f"{data} {ora}"
-            if now >= scheduled_time:
-                send_reminder(row)
-                update_sent_flag(i)
+        try:
+            ora_invio = parse_datetime(data, ora)
+        except:
+            logger.warning(f"Formato orario errato alla riga {i}")
+            continue
 
-if __name__ == '__main__':
-    logger.info("Bot avviato.")
+        if not inviato:
+            if now >= ora_invio:
+                bot.send_message(chat_id=chat_id, text=messaggio)
+                sheet.update_cell(i, 6, f"1|{now.strftime('%d/%m/%Y %H:%M')}")
+        else:
+            split = inviato.split("|")
+            count = int(split[0])
+            ultima = datetime.strptime(split[1], "%d/%m/%Y %H:%M")
+            if now - ora_invio > FINE_SOLLECITI:
+                if count < SOLLECITO_MASSIMO:
+                    bot.send_message(chat_id=chat_id, text=MESSAGGIO_FINE)
+                    sheet.update_cell(i, 6, f"{count+1}|{now.strftime('%d/%m/%Y %H:%M')}")
+            elif now - ultima >= SOLLECITO_INTERVAL:
+                bot.send_message(chat_id=chat_id, text=messaggio)
+                sheet.update_cell(i, 6, f"{count+1}|{now.strftime('%d/%m/%Y %H:%M')}")
+
+if __name__ == "__main__":
     while True:
         try:
-            check_and_send()
-            time.sleep(60)
-        except KeyboardInterrupt:
-            logger.info("Interrotto manualmente.")
-            break
+            invia_messaggi()
         except Exception as e:
-            logger.error(f"Errore inaspettato: {e}")
-            time.sleep(30)
+            logger.error(f"Errore: {e}")
+        time.sleep(60 * 5)  # Controlla ogni 5 minuti
