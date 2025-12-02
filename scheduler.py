@@ -1,9 +1,11 @@
 import time
 from bot_link_preventivi_drive import check_nuovi_preventivi, invia_solleciti
 
-INTERVALLO_CONTROLLI = 300    # ogni 5 minuti
-INTERVALLO_SOLLECITI = 3600   # ogni 1 ora
+# Intervalli in secondi
+INTERVALLO_CONTROLLI = 300           # Ogni 5 minuti
+INTERVALLO_SOLLECITI = 3600          # Ogni 1 ora
 
+# Timestamp iniziali
 ultimo_controllo = 0
 ultimo_sollecito = 0
 
@@ -12,18 +14,22 @@ print("✅ BOT preventivi avviato e in esecuzione...")
 while True:
     ora = time.time()
 
-    # Controlla nuovi preventivi
+    # 🔎 Controllo nuovi preventivi
     if ora - ultimo_controllo >= INTERVALLO_CONTROLLI:
         print("🔎 Controllo nuovi preventivi...")
-        check_nuovi_preventivi()
+        try:
+            check_nuovi_preventivi()
+        except Exception as e:
+            print(f"❌ Errore nel controllo preventivi: {e}")
         ultimo_controllo = ora
-        print("✅ Controllo completato.")
 
-    # Invia solleciti
+    # 🔔 Invio solleciti
     if ora - ultimo_sollecito >= INTERVALLO_SOLLECITI:
-        print("📢 Invio solleciti in corso...")
-        invia_solleciti()
+        print("🔔 Invio solleciti in corso...")
+        try:
+            invia_solleciti()
+        except Exception as e:
+            print(f"❌ Errore nell'invio solleciti: {e}")
         ultimo_sollecito = ora
-        print("✅ Solleciti completati.")
 
-    time.sleep(10)  # breve attesa
+    time.sleep(10)  # Piccola attesa per non sovraccaricare il sistema
