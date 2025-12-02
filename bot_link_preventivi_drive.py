@@ -1,129 +1,96 @@
 import os
 import time
 import json
-from datetime import datetime, timedelta
-from telegram import Bot, Update
-from telegram.ext import Updater, MessageHandler, Filters, CallbackContext
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+import logging
+import gspread
+from datetime import datetime
+from telegram import Bot
+from telegram.constants import ParseMode
+from dotenv import load_dotenv
 
+load_dotenv()
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+
+# Variabili ambiente
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID"))
-GOOGLE_CREDENTIALS = eval(os.getenv("GOOGLE_CREDENTIALS"))
-CHECK_INTERVAL = 60  # ogni 60 secondi
-SOLLECITI_ORE = [4, 8, 24, 48]
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS")
 
+# Converti JSON stringa in dizionario
+if isinstance(GOOGLE_CREDS_JSON, str):
+    GOOGLE_CREDS_JSON = json.loads(GOOGLE_CREDS_JSON)
+
+# Setup bot
 bot = Bot(token=BOT_TOKEN)
-updater = Updater(token=BOT_TOKEN, use_context=True)
-dispatcher = updater.dispatcher
 
-SCOPES = ['https://www.googleapis.com/auth/drive']
-creds = service_account.Credentials.from_service_account_info(GOOGLE_CREDENTIALS, scopes=SCOPES)
-drive_service = build('drive', 'v3', credentials=creds)
+# Google Sheets auth
+gc = gspread.service_account_from_dict(GOOGLE_CREDS_JSON)
+sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
 
-MAIN_FOLDER_NAME = "PreventiviTelegram"
-stato_preventivi = {}
+# Gruppi Telegram
+GRUPPI = {
+    "-1003418284764": "Mustafa",
+    "-100xxxxxxxxxx": "GruppoB",
+    "-100yyyyyyyyyy": "GruppoC"
+}
 
-def trova_cartella_principale():
-    res = drive_service.files().list(
-        q=f"name='{MAIN_FOLDER_NAME}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
-        fields="files(id, name)"
-    ).execute()
-    return res.get('files', [None])[0]['id'] if res.get('files') else None
+# Prevenzione doppio invio
+cache = {}
 
-def trova_sottocartelle(folder_id):
-    res = drive_service.files().list(
-        q=f"'{folder_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
-        fields="files(id, name)"
-    ).execute()
-    return res.get('files', [])
+# Tempo massimo attesa (in secondi) prima del sollecito
+MAX_ATTESA = 4 * 3600  # 4 ore
 
-def crea_link_pubblico(folder_id):
-    drive_service.permissions().create(
-        fileId=folder_id,
-        body={"role": "reader", "type": "anyone"},
-        fields="id"
-    ).execute()
-    return f"https://drive.google.com/drive/folders/{folder_id}"
+# 🔁 Controlla nuovi preventivi
+def check_nuovi_preventivi():
+    rows = sheet.get_all_records()
+    now = time.time()
 
-def invia_messaggio_iniziale(chat_id, nome, link):
-    testo = f"📩 *Nuovo preventivo da confermare:*\n[{nome}]({link})"
-    bot.send_message(chat_id=chat_id, text=testo, parse_mode="Markdown")
+    for row in rows:
+        preventivo = row.get("Nome Preventivo")
+        gruppo_id = str(row.get("ID Gruppo"))
+        confermato = row.get("Confermato", "").strip().lower()
+        timestamp = row.get("Timestamp", "")
 
-def invia_sollecito(chat_id, nome, step):
-    testo = f"⏰ *Sollecito {step + 1}* - In attesa della conferma del preventivo: {nome}"
-    bot.send_message(chat_id=chat_id, text=testo, parse_mode="Markdown")
-
-def invia_rifiuto(chat_id, nome):
-    testo = f"⚠️ Nessuna risposta ricevuta. Il preventivo '{nome}' verrà assegnato ad un'altra impresa."
-    bot.send_message(chat_id=chat_id, text=testo)
-
-def esegui_scansione():
-    principale = trova_cartella_principale()
-    if not principale:
-        print("Cartella principale non trovata")
-        return
-
-    gruppi = trova_sottocartelle(principale)
-    for gruppo in gruppi:
-        if not gruppo['name'].startswith("gruppo_"):
+        if confermato == "sì":
             continue
 
-        chat_id = int(gruppo['name'].replace("gruppo_", ""))
-        preventivi = trova_sottocartelle(gruppo['id'])
-
-        for p in preventivi:
-            key = f"{chat_id}-{p['id']}"
-            if key not in stato_preventivi:
-                link = crea_link_pubblico(p['id'])
-                invia_messaggio_iniziale(chat_id, p['name'], link)
-                stato_preventivi[key] = {
-                    "chat_id": chat_id,
-                    "nome": p["name"],
-                    "link": link,
-                    "timestamp": datetime.now().isoformat(),
-                    "solleciti": 0,
-                    "confermato": False
-                }
-
-def controlla_solleciti():
-    now = datetime.now()
-    for key, stato in stato_preventivi.items():
-        if stato["confermato"]:
+        if not preventivo or gruppo_id not in GRUPPI:
             continue
-        tempo_trascorso = now - datetime.fromisoformat(stato["timestamp"])
-        ore = tempo_trascorso.total_seconds() / 3600
-        step = stato["solleciti"]
 
-        if step < len(SOLLECITI_ORE) and ore >= SOLLECITI_ORE[step]:
-            if step < 3:
-                invia_sollecito(stato["chat_id"], stato["nome"], step)
-                stato_preventivi[key]["solleciti"] += 1
-            else:
-                invia_rifiuto(stato["chat_id"], stato["nome"])
-                stato_preventivi[key]["confermato"] = True
+        if preventivo in cache:
+            continue
 
-def gestore_messaggi(update: Update, context: CallbackContext):
-    msg = update.message.text.lower()
-    chat_id = update.effective_chat.id
-    parole_conferma = ["ok", "confermo", "ricevuto", "va bene"]
-
-    if any(p in msg for p in parole_conferma):
-        for key in list(stato_preventivi):
-            if str(chat_id) in key and not stato_preventivi[key]["confermato"]:
-                bot.send_message(chat_id=chat_id, text=f"✅ Conferma ricevuta per: {stato_preventivi[key]['nome']}")
-                stato_preventivi[key]["confermato"] = True
-                bot.send_message(chat_id=OWNER_ID, text=f"✅ Confermato: {stato_preventivi[key]['nome']} dal gruppo {chat_id}")
-
-dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, gestore_messaggi))
-
-if __name__ == "__main__":
-    updater.start_polling()
-    print("🤖 Bot in ascolto con solleciti attivi...")
-    while True:
+        messaggio = f"📄 <b>Nuovo preventivo da confermare</b>:\n<b>{preventivo}</b>"
         try:
-            esegui_scansione()
-            controlla_solleciti()
+            bot.send_message(chat_id=gruppo_id, text=messaggio, parse_mode=ParseMode.HTML)
+            cache[preventivo] = {
+                "sent_time": now,
+                "gruppo": gruppo_id
+            }
         except Exception as e:
-            print("Errore:", e)
-        time.sleep(CHECK_INTERVAL)
+            logging.error(f"Errore invio messaggio: {e}")
+
+# 🔁 Invia solleciti
+def invia_solleciti():
+    now = time.time()
+    rows = sheet.get_all_records()
+
+    for row in rows:
+        preventivo = row.get("Nome Preventivo")
+        gruppo_id = str(row.get("ID Gruppo"))
+        confermato = row.get("Confermato", "").strip().lower()
+
+        if confermato == "sì" or preventivo not in cache:
+            continue
+
+        tempo_passato = now - cache[preventivo]["sent_time"]
+
+        if tempo_passato >= MAX_ATTESA:
+            try:
+                bot.send_message(chat_id=gruppo_id, text=f"🔔 <b>Promemoria:</b> il preventivo <b>{preventivo}</b> è ancora in attesa di conferma.", parse_mode=ParseMode.HTML)
+                cache[preventivo]["sent_time"] = now
+            except Exception as e:
+                logging.error(f"Errore sollecito: {e}")
