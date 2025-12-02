@@ -5,7 +5,7 @@ import logging
 import gspread
 from datetime import datetime
 from telegram import Bot
-from telegram.constants import ParseMode
+from telegram import ParseMode
 from dotenv import load_dotenv
 
 load_dotenv()
