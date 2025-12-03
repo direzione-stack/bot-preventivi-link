@@ -15,7 +15,7 @@ while True:
 
     # Controllo nuovi preventivi
     if ora - ultimo_controllo >= INTERVALLO_CONTROLLI:
-        print("🔍 Controllo nuovi preventivi in corso...")
+        print("🔄 Controllo nuovi preventivi in corso...")
         check_nuovi_preventivi()
         ultimo_controllo = ora
 
