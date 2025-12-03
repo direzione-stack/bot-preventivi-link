@@ -80,7 +80,7 @@ def scan_and_send():
                 continue  # Già inviato
 
             link = generate_share_link(p['id'])
-            messaggio = f"📂 *Nuovo preventivo disponibile:*
+            messaggio = f"📁 *Nuovo preventivo disponibile:*\n{nome_file}"
 [{p['name']}]({link})"
             try:
                 bot.send_message(chat_id=int(gruppo_id), text=messaggio, parse_mode=telegram.ParseMode.MARKDOWN)
