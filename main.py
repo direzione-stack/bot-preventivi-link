@@ -80,7 +80,7 @@ def scan_and_send():
 
             link = generate_share_link(p['id'])
             nome_file = p['name']
-            messaggio = f"📁 *Nuovo preventivo disponibile:*\n{nome_file}\n[{nome_file}]({link})"
+            messaggio = f"📁 *Nuovo preventivo disponibile:*\n[{p['name']}]({link})"
             try:
                 bot.send_message(chat_id=int(gruppo_id), text=messaggio, parse_mode=telegram.ParseMode.MARKDOWN)
                 cache[key] = True
