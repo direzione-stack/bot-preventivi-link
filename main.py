@@ -3,6 +3,7 @@ import time
 import json
 import telegram
 import gspread
+import traceback
 from google.oauth2 import service_account
 
 # === CONFIG ===
@@ -32,22 +33,30 @@ from googleapiclient.discovery import build
 drive = build('drive', 'v3', credentials=drive_service)
 
 def get_subfolders(parent_id):
-    query = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    results = drive.files().list(q=query, fields="files(id, name)").execute()
-    return results.get('files', [])
+    try:
+        query = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        results = drive.files().list(q=query, fields="files(id, name)").execute()
+        return results.get('files', [])
+    except Exception as e:
+        print(f"Errore durante recupero sottocartelle: {e}")
+        return []
 
 def get_folder_id_by_name(name):
-    query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    results = drive.files().list(q=query, fields="files(id, name)").execute()
-    folders = results.get('files', [])
-    return folders[0]['id'] if folders else None
+    try:
+        query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        results = drive.files().list(q=query, fields="files(id, name)").execute()
+        folders = results.get('files', [])
+        return folders[0]['id'] if folders else None
+    except Exception as e:
+        print(f"Errore durante ricerca cartella principale: {e}")
+        return None
 
 def generate_share_link(folder_id):
-    permission = {
-        'type': 'anyone',
-        'role': 'reader'
-    }
     try:
+        permission = {
+            'type': 'anyone',
+            'role': 'reader'
+        }
         drive.permissions().create(fileId=folder_id, body=permission).execute()
     except:
         pass  # Permission might already exist
@@ -86,5 +95,5 @@ if __name__ == '__main__':
         try:
             scan_and_send()
         except Exception as e:
-            print(f"Errore nel ciclo: {e}")
+            print(f"❌ Errore generale nel ciclo principale:\n{traceback.format_exc()}")
         time.sleep(CHECK_INTERVAL)
