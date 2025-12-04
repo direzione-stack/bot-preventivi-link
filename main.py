@@ -1,132 +1,114 @@
+# main.py
 import os
 import time
-import json
 import telegram
-import traceback
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from datetime import datetime, timedelta
+from report_writer import log_confirmation  # modulo opzionale
 
-# CONFIG
+# === CONFIG ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS")
-
-if isinstance(GOOGLE_CREDS_JSON, str):
-    GOOGLE_CREDS_JSON = json.loads(GOOGLE_CREDS_JSON)
+FOLDER_NAME = "PreventiviTelegram"
+CHECK_INTERVAL = 60  # ogni 60 secondi
+SOLLECITO_INTERVAL = 4 * 60 * 60  # ogni 4 ore
 
 bot = telegram.Bot(token=BOT_TOKEN)
 
-# Setup Google Drive API
-creds = service_account.Credentials.from_service_account_info(GOOGLE_CREDS_JSON)
-drive = build('drive', 'v3', credentials=creds)
+# === GOOGLE DRIVE ===
+creds = service_account.Credentials.from_service_account_info(eval(os.getenv("GOOGLE_CREDENTIALS")))
+drive = build("drive", "v3", credentials=creds)
 
-# Config
-ROOT_FOLDER_NAME = "PreventiviTelegram"  # la cartella principale su Drive
-CHECK_INTERVAL = 60        # ogni 60 secondi
-SOLLECITO_INTERVALO = 4 * 3600  # ogni 4 ore
-SCADENZA = 48 * 3600       # dopo 48 ore dal primo invio
+# === TRACKING ===
+cache = {}
+solleciti = {}
 
-# Tracciamento in memoria
-cache = {}  # {folder_id: {chat_id, nome, timestamp_invio}}
-
-def get_subfolders(parent_id):
-    q = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    resp = drive.files().list(q=q, fields="files(id, name)").execute()
-    return resp.get('files', [])
 
 def get_folder_id_by_name(name):
-    q = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    resp = drive.files().list(q=q, fields="files(id, name)").execute()
-    folders = resp.get('files', [])
+    results = drive.files().list(q=f"name='{name}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                                 spaces='drive', fields="files(id, name)").execute()
+    folders = results.get('files', [])
     return folders[0]['id'] if folders else None
 
-def share_folder_public(folder_id):
+
+def get_subfolders(parent_id):
+    results = drive.files().list(q=f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false",
+                                 spaces='drive', fields="files(id, name)").execute()
+    return results.get('files', [])
+
+
+def generate_share_link(folder_id):
+    permission = {
+        'type': 'anyone',
+        'role': 'reader'
+    }
     try:
-        drive.permissions().create(
-            fileId=folder_id,
-            body={"type":"anyone", "role":"reader"},
-        ).execute()
-    except Exception:
-        pass
+        drive.permissions().create(fileId=folder_id, body=permission).execute()
+    except:
+        pass  # permission already exists
     return f"https://drive.google.com/drive/folders/{folder_id}"
 
+
+def send_preventivo(gruppo_id, nome, link):
+    messaggio = f"*📁 Nuovo preventivo disponibile:*
+[{nome}]({link})"
+    bot.send_message(chat_id=gruppo_id, text=messaggio, parse_mode=telegram.ParseMode.MARKDOWN)
+    cache[f"{gruppo_id}_{nome}"] = time.time()
+    solleciti[f"{gruppo_id}_{nome}"] = time.time()
+
+
+def invia_solleciti():
+    for chiave, ts_invio in solleciti.items():
+        if time.time() - ts_invio >= SOLLECITO_INTERVAL:
+            gruppo_id, nome = chiave.split("_", 1)
+            bot.send_message(chat_id=gruppo_id, text=f"⏰ *Sollecito:* confermi il preventivo [{nome}]?",
+                             parse_mode=telegram.ParseMode.MARKDOWN)
+            solleciti[chiave] = time.time()
+
+
 def scan_and_send():
-    root_id = get_folder_id_by_name(ROOT_FOLDER_NAME)
+    root_id = get_folder_id_by_name(FOLDER_NAME)
     if not root_id:
-        print("⚠️ Cartella principale non trovata:", ROOT_FOLDER_NAME)
+        print("❌ Cartella root non trovata.")
         return
 
     gruppi = get_subfolders(root_id)
-    for g in gruppi:
-        gruppo_folder_id = g['id']
-        gruppo_id = g['name'].replace("gruppo_", "")
-        subfolders = get_subfolders(gruppo_folder_id)
-        for p in subfolders:
-            folder_id = p['id']
-            key = folder_id
-            if key in cache:
-                continue  # già inviato
+    for gruppo in gruppi:
+        gruppo_id = gruppo['name'].replace("gruppo_", "")
+        gruppo_folder_id = gruppo['id']
+        preventivi = get_subfolders(gruppo_folder_id)
 
-            link = share_folder_public(folder_id)
-            nome = p['name']
-            text = f"📄 *Nuovo preventivo disponibile*\n{nome}\n🔗 {link}"
-            try:
-                bot.send_message(chat_id=int(gruppo_id), text=text, parse_mode=telegram.ParseMode.MARKDOWN)
-                cache[key] = {
-                    "chat_id": gruppo_id,
-                    "nome": nome,
-                    "timestamp": time.time()
-                }
-                print("📬 Inviato:", nome, "-> gruppo", gruppo_id)
-            except Exception as e:
-                print("❌ Errore invio:", e)
+        for p in preventivi:
+            chiave = f"{gruppo_id}_{p['name']}"
+            if chiave not in cache:
+                link = generate_share_link(p['id'])
+                send_preventivo(gruppo_id, p['name'], link)
 
-def gestisci_solleciti_e_scadenze():
-    now = time.time()
-    for key, info in list(cache.items()):
-        elapsed = now - info["timestamp"]
-        if elapsed > SCADENZA:
-            try:
-                bot.send_message(chat_id=int(info["chat_id"]),
-                                 text=f"⛔ Il preventivo *{info['nome']}* non è stato confermato. Termine scaduto.")
-            except Exception:
-                pass
-            del cache[key]
-        elif elapsed > SOLLECITO_INTERVALO:
-            try:
-                bot.send_message(chat_id=int(info["chat_id"]),
-                                 text=f"🔔 Sollecito: manca conferma per il preventivo *{info['nome']}*")
-                cache[key]["timestamp"] = now
-            except Exception:
-                pass
 
-def handle_confirm(update, context):
-    chat_id = update.message.chat_id
+def gestisci_risposte(update, context):
     testo = update.message.text.lower()
-    if any(w in testo for w in ["ok", "confermo", "va bene", "accetto"]):
-        for key, info in list(cache.items()):
-            if str(info["chat_id"]) == str(chat_id):
-                nome = info["nome"]
-                bot.send_message(chat_id, f"✅ Preventivo *{nome}* confermato! Grazie.")
-                print("✅ Confermato:", nome, "dal gruppo", chat_id)
-                del cache[key]
-                break
+    chat_id = str(update.message.chat_id)
+    nome_utente = update.message.from_user.full_name
+    if any(k in testo for k in ["ok", "confermo", "va bene", "accetto"]):
+        context.bot.send_message(chat_id=chat_id, text="✅ Preventivo confermato, grazie!")
+        log_confirmation(chat_id, nome_utente)  # scrive su Google Sheet (opzionale)
 
-def main():
+
+# === AVVIO ===
+if __name__ == '__main__':
     from telegram.ext import Updater, MessageHandler, Filters
-    updater = Updater(BOT_TOKEN, use_context=True)
+
+    updater = Updater(token=BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
-    dp.add_handler(MessageHandler(Filters.text & (~Filters.command), handle_confirm))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, gestisci_risposte))
 
     updater.start_polling()
-    print("🤖 Bot attivo (solo Google Drive + Telegram)")
+    print("🚀 BOT avviato e in ascolto...")
 
     while True:
         try:
             scan_and_send()
-            gestisci_solleciti_e_scadenze()
+            invia_solleciti()
         except Exception as e:
-            print("❌ Errore ciclo:", traceback.format_exc())
+            print(f"❌ Errore: {e}")
         time.sleep(CHECK_INTERVAL)
-
-if __name__ == "__main__":
-    main()
