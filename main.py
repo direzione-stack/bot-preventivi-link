@@ -4,6 +4,8 @@ import json
 import telegram
 import gspread
 import traceback
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
 from google.oauth2 import service_account
 
 # === CONFIG ===
