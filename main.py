@@ -5,100 +5,100 @@ import telegram
 import gspread
 import traceback
 from google.oauth2 import service_account
-from datetime import datetime
 
 # === CONFIG ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS")
 
 if isinstance(GOOGLE_CREDS_JSON, str):
     GOOGLE_CREDS_JSON = json.loads(GOOGLE_CREDS_JSON)
 
-# === TELEGRAM ===
 bot = telegram.Bot(token=BOT_TOKEN)
 
-# === GOOGLE SHEET ===
+# === GOOGLE ===
 creds = service_account.Credentials.from_service_account_info(GOOGLE_CREDS_JSON)
 gc = gspread.authorize(creds)
-sheet = gc.open("Report Preventivi").sheet1
-
-# === CONFIGURAZIONI ===
-FREQUENZA_CONTROLLO = 60         # Ogni 60 secondi
-FREQUENZA_SOLLECITI = 4 * 3600  # Ogni 4 ore
-CONFERME = ["ok", "confermo", "va bene", "accetto"]
+sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
 
 # === STATO ===
-cache_inviati = {}
-tempi_solleciti = {}
+cache = {}
+SOLLECITO_INTERVALLO = 4 * 3600  # 4 ore
+ultima_verifica = 0
 
-# === FUNZIONI ===
-def invia_preventivi():
+print("✅ BOT avviato e in ascolto di nuovi preventivi...")
+
+def invia_messaggio(chat_id, testo):
+    try:
+        bot.send_message(chat_id=chat_id, text=testo, parse_mode=telegram.ParseMode.MARKDOWN)
+        return True
+    except Exception as e:
+        print(f"❌ Errore invio a gruppo {chat_id}: {e}")
+        return False
+
+def controlla_nuovi_preventivi():
+    global cache
     righe = sheet.get_all_records()
     ora = time.time()
 
     for i, riga in enumerate(righe, start=2):
-        chat_id = riga.get("chat_id")
-        cartella = riga.get("cartella")
-        stato = riga.get("stato", "").lower()
-        timestamp = riga.get("timestamp_invio")
+        preventivo = riga.get("Nome Preventivo")
+        chat_id = str(riga.get("ID Gruppo"))
+        stato = str(riga.get("Stato", "")).strip().lower()
 
         if stato == "completato":
             continue
 
-        chiave = f"{chat_id}_{cartella}"
-        tempo_ultimo = cache_inviati.get(chiave)
-
-        if not timestamp:
-            messaggio = f"📂 *Nuovo preventivo disponibile:*\n`{cartella}`"
-            try:
-                bot.send_message(chat_id=chat_id, text=messaggio, parse_mode=telegram.ParseMode.MARKDOWN)
-                now_str = datetime.utcnow().isoformat()
-                sheet.update_cell(i, 3, now_str)
-                cache_inviati[chiave] = ora
-                tempi_solleciti[chiave] = [ora, 0]  # timestamp, n solleciti
-            except Exception as e:
-                print(f"❌ Errore invio a {chat_id}: {e}")
-            continue
-
-        # Sollecito
-        if chiave in tempi_solleciti:
-            ts_inizio, num_solleciti = tempi_solleciti[chiave]
-            tempo_passato = ora - ts_inizio
-
-            if tempo_passato >= FREQUENZA_SOLLECITI:
-                try:
-                    testo = f"🔔 *Sollecito #{num_solleciti + 1}* per confermare il preventivo:\n`{cartella}`"
-                    bot.send_message(chat_id=chat_id, text=testo, parse_mode=telegram.ParseMode.MARKDOWN)
-                    tempi_solleciti[chiave] = [ora, num_solleciti + 1]
-                except Exception as e:
-                    print(f"❌ Errore sollecito {chat_id}: {e}")
+        if preventivo not in cache:
+            messaggio = f"*📂 Nuovo preventivo disponibile:*
+{preventivo}"
+            if invia_messaggio(chat_id, messaggio):
+                cache[preventivo] = {
+                    "time": ora,
+                    "chat_id": chat_id,
+                    "row": i
+                }
+                sheet.update_cell(i, list(riga.keys()).index("Timestamp Invio") + 1, time.strftime('%Y-%m-%d %H:%M:%S'))
 
 
-def ascolta_risposte():
-    updates = bot.get_updates(timeout=10)
+def invia_solleciti():
+    ora = time.time()
+    for preventivo, info in cache.items():
+        if ora - info["time"] > SOLLECITO_INTERVALLO:
+            messaggio = f"*🔔 Sollecito:* Confermare il preventivo: *{preventivo}*"
+            if invia_messaggio(info["chat_id"], messaggio):
+                cache[preventivo]["time"] = ora
+
+
+def ascolta_conferme():
+    updates = bot.get_updates(limit=100, timeout=5)
+
     for update in updates:
-        msg = update.message
-        if not msg or not msg.text:
-            continue
+        if update.message:
+            testo = update.message.text.lower()
+            chat_id = str(update.message.chat_id)
 
-        testo = msg.text.strip().lower()
-        chat_id = str(msg.chat_id)
-        if any(r in testo for r in CONFERME):
-            righe = sheet.get_all_records()
-            for i, riga in enumerate(righe, start=2):
-                if str(riga.get("chat_id")) == chat_id and riga.get("stato", "").lower() != "completato":
-                    sheet.update_cell(i, 4, "completato")
-                    bot.send_message(chat_id=chat_id, text="✅ Preventivo confermato! Grazie.")
-                    break
+            if any(k in testo for k in ["ok", "confermo", "va bene", "accetto"]):
+                righe = sheet.get_all_records()
+                for i, riga in enumerate(righe, start=2):
+                    if str(riga.get("ID Gruppo")) == chat_id and riga.get("Stato", "").lower() != "completato":
+                        preventivo = riga.get("Nome Preventivo")
+                        sheet.update_cell(i, list(riga.keys()).index("Stato") + 1, "completato")
+                        invia_messaggio(chat_id, f"✅ Preventivo *{preventivo}* confermato. Grazie!")
+                        if preventivo in cache:
+                            del cache[preventivo]
 
 
-# === MAIN ===
-print("✅ BOT avviato. In ascolto...")
 while True:
     try:
-        invia_preventivi()
-        ascolta_risposte()
+        ascolta_conferme()
+
+        if time.time() - ultima_verifica >= 60:
+            controlla_nuovi_preventivi()
+            invia_solleciti()
+            ultima_verifica = time.time()
+
     except Exception as e:
         print(f"❌ Errore generale:\n{traceback.format_exc()}")
-    time.sleep(FREQUENZA_CONTROLLO)
+
+    time.sleep(10)
