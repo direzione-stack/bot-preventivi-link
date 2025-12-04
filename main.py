@@ -5,100 +5,107 @@ import telegram
 import gspread
 import traceback
 from google.oauth2 import service_account
+from datetime import datetime
 
 # === CONFIG ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 
 if isinstance(GOOGLE_CREDS_JSON, str):
     GOOGLE_CREDS_JSON = json.loads(GOOGLE_CREDS_JSON)
 
+# === TELEGRAM ===
 bot = telegram.Bot(token=BOT_TOKEN)
 
-# === GOOGLE ===
+# === GOOGLE DRIVE / SHEETS ===
 creds = service_account.Credentials.from_service_account_info(GOOGLE_CREDS_JSON)
 gc = gspread.authorize(creds)
-sheet = gc.open_by_key(SPREADSHEET_ID).sheet1
+sh = gc.open_by_key(SPREADSHEET_ID)
+sheet = sh.sheet1
 
-# === STATO ===
+# === COSTANTI ===
+SOLLECITO_INTERVALLO = 4 * 60 * 60  # ogni 4 ore
+FINE_SOLLECITI = 48 * 60 * 60       # max 48 ore
+
+# === TRACKING ===
+solleciti = {}
 cache = {}
-SOLLECITO_INTERVALLO = 4 * 3600  # 4 ore
-ultima_verifica = 0
 
-print("✅ BOT avviato e in ascolto di nuovi preventivi...")
-
+# === FUNZIONE INVIO MESSAGGI ===
 def invia_messaggio(chat_id, testo):
     try:
         bot.send_message(chat_id=chat_id, text=testo, parse_mode=telegram.ParseMode.MARKDOWN)
-        return True
     except Exception as e:
         print(f"❌ Errore invio a gruppo {chat_id}: {e}")
-        return False
 
-def controlla_nuovi_preventivi():
-    global cache
+# === FUNZIONE PRINCIPALE ===
+def ciclo():
     righe = sheet.get_all_records()
-    ora = time.time()
+    ora_attuale = datetime.utcnow()
 
-    for i, riga in enumerate(righe, start=2):
-        preventivo = riga.get("Nome Preventivo")
-        chat_id = str(riga.get("ID Gruppo"))
-        stato = str(riga.get("Stato", "")).strip().lower()
+    for idx, riga in enumerate(righe):
+        chat_id = int(riga.get("chat_id", 0))
+        nome_cartella = riga.get("cartella", "")
+        timestamp_str = riga.get("timestamp_invio", "")
+        stato = riga.get("stato", "").lower()
 
         if stato == "completato":
             continue
 
-        if preventivo not in cache:
-            messaggio = f"*📂 Nuovo preventivo disponibile:*
-{preventivo}"
-            if invia_messaggio(chat_id, messaggio):
-                cache[preventivo] = {
-                    "time": ora,
-                    "chat_id": chat_id,
-                    "row": i
-                }
-                sheet.update_cell(i, list(riga.keys()).index("Timestamp Invio") + 1, time.strftime('%Y-%m-%d %H:%M:%S'))
+        # Se non ancora inviato
+        if not timestamp_str:
+            timestamp_invio = ora_attuale.isoformat()
+            sheet.update_cell(idx + 2, list(riga.keys()).index("timestamp_invio") + 1, timestamp_invio)
+            invia_messaggio(chat_id, f"*📁 Nuovo preventivo disponibile:*\n{nome_cartella}")
+            solleciti[chat_id] = [ora_attuale, 0]
+            continue
 
+        # Se già inviato, gestisci solleciti
+        ts_inizio = datetime.fromisoformat(timestamp_str)
+        tempo_trascorso = (ora_attuale - ts_inizio).total_seconds()
 
-def invia_solleciti():
-    ora = time.time()
-    for preventivo, info in cache.items():
-        if ora - info["time"] > SOLLECITO_INTERVALLO:
-            messaggio = f"*🔔 Sollecito:* Confermare il preventivo: *{preventivo}*"
-            if invia_messaggio(info["chat_id"], messaggio):
-                cache[preventivo]["time"] = ora
+        if tempo_trascorso > FINE_SOLLECITI:
+            idx_col_stato = list(riga.keys()).index("stato") + 1
+            sheet.update_cell(idx + 2, idx_col_stato, "scaduto")
+            invia_messaggio(chat_id, "❌ Tempo scaduto. Il lavoro verrà assegnato ad altri partner.")
+            continue
 
+        if chat_id in solleciti:
+            ultimo, n = solleciti[chat_id]
+            if (ora_attuale - ultimo).total_seconds() >= SOLLECITO_INTERVALLO:
+                invia_messaggio(chat_id, f"*⏰ Sollecito #{n + 1}* per confermare il preventivo: {nome_cartella}")
+                solleciti[chat_id] = [ora_attuale, n + 1]
+        else:
+            solleciti[chat_id] = [ts_inizio, 0]
 
-def ascolta_conferme():
-    updates = bot.get_updates(limit=100, timeout=5)
+# === LISTENER RISPOSTE ===
+def listener():
+    updates = bot.get_updates(offset=-1, timeout=1)
+    righe = sheet.get_all_records()
 
     for update in updates:
-        if update.message:
-            testo = update.message.text.lower()
-            chat_id = str(update.message.chat_id)
+        if not update.message:
+            continue
 
-            if any(k in testo for k in ["ok", "confermo", "va bene", "accetto"]):
-                righe = sheet.get_all_records()
-                for i, riga in enumerate(righe, start=2):
-                    if str(riga.get("ID Gruppo")) == chat_id and riga.get("Stato", "").lower() != "completato":
-                        preventivo = riga.get("Nome Preventivo")
-                        sheet.update_cell(i, list(riga.keys()).index("Stato") + 1, "completato")
-                        invia_messaggio(chat_id, f"✅ Preventivo *{preventivo}* confermato. Grazie!")
-                        if preventivo in cache:
-                            del cache[preventivo]
+        chat_id = update.message.chat_id
+        testo = update.message.text.lower()
+        if testo in ["ok", "confermo", "va bene", "accetto"]:
+            for i, riga in enumerate(righe):
+                if int(riga.get("chat_id", 0)) == chat_id and riga.get("stato", "").lower() != "completato":
+                    idx_col_stato = list(riga.keys()).index("stato") + 1
+                    sheet.update_cell(i + 2, idx_col_stato, "completato")
+                    invia_messaggio(chat_id, "✅ Preventivo confermato! Grazie.")
+                    break
 
+# === LOOP ===
+print("✅ BOT avviato e in ascolto di nuovi preventivi...")
 
 while True:
     try:
-        ascolta_conferme()
-
-        if time.time() - ultima_verifica >= 60:
-            controlla_nuovi_preventivi()
-            invia_solleciti()
-            ultima_verifica = time.time()
-
+        ciclo()
+        listener()
     except Exception as e:
-        print(f"❌ Errore generale:\n{traceback.format_exc()}")
-
-    time.sleep(10)
+        print(f"❌ Errore nel ciclo principale:\n{traceback.format_exc()}")
+    time.sleep(60)
