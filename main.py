@@ -4,8 +4,6 @@ import json
 import telegram
 import gspread
 import traceback
-import sys
-sys.stdout.reconfigure(encoding='utf-8')
 from google.oauth2 import service_account
 
 # === CONFIG ===
@@ -19,135 +17,105 @@ if isinstance(GOOGLE_CREDS_JSON, str):
 # === TELEGRAM ===
 bot = telegram.Bot(token=BOT_TOKEN)
 
-# === GOOGLE DRIVE ===
+# === GOOGLE DRIVE / SHEETS ===
 creds = service_account.Credentials.from_service_account_info(GOOGLE_CREDS_JSON)
 gc = gspread.authorize(creds)
 sheet = gc.open("Report Preventivi").sheet1
-
-# === TRACKING stato preventivi inviati ===
-cache = {}
 
 # === CONFIG ===
 FOLDER_NAME = "PreventiviTelegram"
 CHECK_INTERVAL = 60  # ogni 60 secondi
 SOLLECITO_INTERVALLO = 4 * 60 * 60  # ogni 4 ore
-FINE_SOLLECITI = 48 * 60 * 60  # dopo 48 ore
 
-# === UTILS GOOGLE DRIVE ===
-from googleapiclient.discovery import build
-drive_service = creds.with_scopes(['https://www.googleapis.com/auth/drive'])
-drive = build('drive', 'v3', credentials=drive_service)
+# === TRACKING ===
+cache = {}
+solleciti = {}
 
-def get_subfolders(parent_id):
-    try:
-        query = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        results = drive.files().list(q=query, fields="files(id, name)").execute()
-        return results.get('files', [])
-    except Exception as e:
-        print(f"[ERRORE] Recupero sottocartelle: {e}")
-        return []
-
-def get_folder_id_by_name(name):
-    try:
-        query = f"name = '{name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        results = drive.files().list(q=query, fields="files(id, name)").execute()
-        folders = results.get('files', [])
-        return folders[0]['id'] if folders else None
-    except Exception as e:
-        print(f"[ERRORE] Ricerca cartella principale: {e}")
-        return None
-
-def generate_share_link(folder_id):
-    try:
-        permission = {
-            'type': 'anyone',
-            'role': 'reader'
-        }
-        drive.permissions().create(fileId=folder_id, body=permission).execute()
-    except:
-        pass  # ignoriamo se il permesso esiste
-    return f"https://drive.google.com/drive/folders/{folder_id}"
-
-def aggiorna_conferma(chat_id):
+# === UTILS ===
+def aggiorna_stato(chat_id, stato):
     records = sheet.get_all_records()
-    for idx, row in enumerate(records, start=2):
+    for i, row in enumerate(records):
         if str(row.get("chat_id")) == str(chat_id):
-            sheet.update_cell(idx, 4, "confermato")
-            break
+            cell = f"D{i+2}"
+            sheet.update(cell, stato)
+            return
 
-def scan_and_send():
-    root_id = get_folder_id_by_name(FOLDER_NAME)
-    if not root_id:
-        print("[X] Cartella PreventiviTelegram non trovata.")
-        return
+def aggiorna_timestamp(chat_id):
+    ora = time.strftime("%Y-%m-%d %H:%M:%S")
+    records = sheet.get_all_records()
+    for i, row in enumerate(records):
+        if str(row.get("chat_id")) == str(chat_id):
+            cell = f"C{i+2}"
+            sheet.update(cell, ora)
+            return
 
-    gruppi = get_subfolders(root_id)
-    for gruppo in gruppi:
-        gruppo_id = gruppo['name'].replace("gruppo_", "")
-        gruppo_folder_id = gruppo['id']
-        preventivi = get_subfolders(gruppo_folder_id)
+def check_conferma(messaggio):
+    testo = messaggio.text.strip().lower()
+    return testo in ["ok", "confermo", "va bene", "accetto"]
 
-        for p in preventivi:
-            key = f"{gruppo_id}_{p['id']}"
-            if key in cache:
-                continue  # Già inviato
+# === FUNZIONE INVIO ===
+def invia_preventivi():
+    rows = sheet.get_all_records()
+    ora_attuale = time.time()
 
-            link = generate_share_link(p['id'])
-            nome_file = p['name']
-messaggio = f"*📁 Nuovo preventivo disponibile:*\n{nome_file}\n[{p['name']}]({link})"
-            try:
-                bot.send_message(chat_id=int(gruppo_id), text=messaggio, parse_mode=telegram.ParseMode.MARKDOWN)
-                cache[key] = {
-                    'timestamp': time.time(),
-                    'chat_id': gruppo_id,
-                    'nome': nome_file
-                }
-                print(f"[\u2714] Inviato {nome_file} al gruppo {gruppo_id}")
-            except Exception as e:
-                print(f"[X] Errore invio a gruppo {gruppo_id}: {e}")
+    for row in rows:
+        chat_id = row.get("chat_id")
+        folder = row.get("cartella")
+        timestamp = row.get("timestamp_invio")
+        stato = row.get("stato", "").lower()
 
-def invia_solleciti():
-    now = time.time()
-    for key, info in cache.items():
-        tempo_passato = now - info['timestamp']
-        if tempo_passato > FINE_SOLLECITI:
-            try:
-                bot.send_message(chat_id=int(info['chat_id']), text=f"❌ Il preventivo *{info['nome']}* non è stato confermato. Sarà assegnato ad altri.", parse_mode=telegram.ParseMode.MARKDOWN)
-                print(f"[X] Messaggio di chiusura a {info['chat_id']}")
-            except:
-                pass
+        if stato == "completato":
             continue
-        elif tempo_passato > SOLLECITO_INTERVALLO:
+
+        if not timestamp:
             try:
-                bot.send_message(chat_id=int(info['chat_id']), text=f"⏰ Sollecito: conferma il preventivo *{info['nome']}*", parse_mode=telegram.ParseMode.MARKDOWN)
-                cache[key]['timestamp'] = now  # aggiorna orario
-                print(f"[\u231b] Sollecito inviato a {info['chat_id']}")
-            except:
-                pass
+                messaggio = f"📁 *Nuovo preventivo disponibile:*
+{folder}"
+                bot.send_message(chat_id=chat_id, text=messaggio, parse_mode=telegram.ParseMode.MARKDOWN)
+                aggiorna_timestamp(chat_id)
+                solleciti[chat_id] = (ora_attuale, 0)
+            except Exception as e:
+                print(f"Errore invio a {chat_id}: {e}")
+            continue
 
-def ascolta_conferme(update):
-    messaggio = update.message.text.lower()
-    chat_id = update.message.chat.id
-    if messaggio in ["ok", "confermo", "va bene", "accetto"]:
-        aggiorna_conferma(chat_id)
+        ts_inizio = time.mktime(time.strptime(timestamp, "%Y-%m-%d %H:%M:%S"))
+        tempo_trascorso = ora_attuale - ts_inizio
+
+        if tempo_trascorso >= SOLLECITO_INTERVALLO:
+            ultimo, numero = solleciti.get(chat_id, (ts_inizio, 0))
+            if ora_attuale - ultimo >= SOLLECITO_INTERVALLO:
+                try:
+                    messaggio = f"⚠️ *Sollecito #{numero+1}:* conferma il preventivo {folder}"
+                    bot.send_message(chat_id=chat_id, text=messaggio, parse_mode=telegram.ParseMode.MARKDOWN)
+                    solleciti[chat_id] = (ora_attuale, numero+1)
+                except Exception as e:
+                    print(f"Errore sollecito a {chat_id}: {e}")
+
+# === HANDLER MESSAGGI ===
+def gestisci_messaggi(update, context):
+    msg = update.message
+    chat_id = msg.chat_id
+
+    if check_conferma(msg):
         try:
-            bot.send_message(chat_id=chat_id, text="✅ Grazie, preventivo confermato.")
-        except:
-            pass
+            bot.send_message(chat_id=chat_id, text="✅ Preventivo confermato. Grazie!", parse_mode=telegram.ParseMode.MARKDOWN)
+            aggiorna_stato(chat_id, "completato")
+        except Exception as e:
+            print(f"Errore risposta conferma: {e}")
 
-from telegram.ext import Updater, MessageHandler, Filters
+# === MAIN ===
+if __name__ == "__main__":
+    print("✅ BOT avviato e in ascolto di nuovi preventivi...")
 
-if __name__ == '__main__':
-    print("[INFO] BOT avviato e in ascolto di nuovi preventivi...")
+    from telegram.ext import Updater, MessageHandler, Filters
     updater = Updater(token=BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
-    dp.add_handler(MessageHandler(Filters.text & (~Filters.command), ascolta_conferme))
+    dp.add_handler(MessageHandler(Filters.text & (~Filters.command), gestisci_messaggi))
     updater.start_polling()
 
     while True:
         try:
-            scan_and_send()
-            invia_solleciti()
+            invia_preventivi()
         except Exception as e:
-            print(f"[X] Errore nel ciclo principale: {traceback.format_exc()}")
+            print(f"Errore generale:", traceback.format_exc())
         time.sleep(CHECK_INTERVAL)
