@@ -50,8 +50,7 @@ def generate_share_link(folder_id):
 
 
 def send_preventivo(gruppo_id, nome, link):
-    messaggio = f"*📁 Nuovo preventivo disponibile:*
-[{nome}]({link})"
+    messaggio = f"*Nuovo preventivo disponibile:*\n{nome_file}\n{link}"
     bot.send_message(chat_id=gruppo_id, text=messaggio, parse_mode=telegram.ParseMode.MARKDOWN)
     cache[f"{gruppo_id}_{nome}"] = time.time()
     solleciti[f"{gruppo_id}_{nome}"] = time.time()
