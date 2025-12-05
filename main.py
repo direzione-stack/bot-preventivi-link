@@ -145,6 +145,5 @@ if __name__ == '__main__':
             scan_and_send()
             invia_sollecito()
         except Exception as e:
-            print("❌ Errore:")
-{traceback.format_exc()}")
+            print(f"❌ Errore: {traceback.format_exc()}")
         time.sleep(CHECK_INTERVAL)
