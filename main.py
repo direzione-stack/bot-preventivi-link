@@ -2,7 +2,6 @@ import os
 import time
 import telegram
 import traceback
-from datetime import datetime, timedelta
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
@@ -11,8 +10,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 FOLDER_NAME = "PreventiviTelegram"
 CONFIRMATION_GROUP_ID = -5071236492
 CHECK_INTERVAL = 60  # ogni 60 secondi
-SOLLECITO_INTERVAL = 14400  # ogni 4 ore (in secondi)
-SOLLECITO_MAX_HOURS = 48
+SOLLECITO_INTERVAL = 4 * 3600  # ogni 4 ore
+SOLLECITO_MAX = 12  # per 48 ore
 
 bot = telegram.Bot(token=BOT_TOKEN)
 
@@ -23,11 +22,10 @@ creds = service_account.Credentials.from_service_account_file(CREDENTIALS_FILE, 
 drive = build('drive', 'v3', credentials=creds)
 
 # === CACHE ===
-sent_cache = {}
-reminder_cache = {}
+sent_cache = {}  # chiave: gruppo_id_preventivo_id
+reminder_cache = {}  # chiave: gruppo_id_preventivo_id -> [timestamp_primo_invio, numero_solleciti]
 confirmed_cache = set()
 
-# === DRIVE UTILS ===
 def get_subfolders(parent_id):
     try:
         query = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -49,17 +47,54 @@ def get_folder_id_by_name(name):
 
 def generate_share_link(folder_id):
     try:
-        permission = {'type': 'anyone', 'role': 'reader'}
+        permission = {
+            'type': 'anyone',
+            'role': 'reader'
+        }
         drive.permissions().create(fileId=folder_id, body=permission).execute()
     except:
         pass
     return f"https://drive.google.com/drive/folders/{folder_id}"
 
-# === SCAN E INVIO ===
+def invia_preventivo(gruppo_id, nome_file, link, key):
+    messaggio = f"\u2709\ufe0f <b>Nuovo preventivo disponibile:</b>\n<b>{nome_file}</b>\n{link}"
+    try:
+        bot.send_message(chat_id=gruppo_id, text=messaggio, parse_mode=telegram.ParseMode.HTML)
+        bot.send_message(chat_id=CONFIRMATION_GROUP_ID, text=f"\u2705 Inviato al gruppo <code>{gruppo_id}</code>: {nome_file}", parse_mode=telegram.ParseMode.HTML)
+        sent_cache[key] = True
+        reminder_cache[key] = [time.time(), 0]
+        print(f"✅ Inviato: {nome_file} al gruppo {gruppo_id}")
+    except Exception as e:
+        print(f"❌ Errore invio a gruppo {gruppo_id}: {e}")
+
+def invia_sollecito():
+    ora = time.time()
+    for key in list(reminder_cache):
+        if key in confirmed_cache:
+            continue
+        primo_invio, count = reminder_cache[key]
+        if count >= SOLLECITO_MAX:
+            gruppo_id = key.split("_")[0]
+            try:
+                bot.send_message(chat_id=int(gruppo_id), text="❌ Ci dispiace che tu non abbia risposto. Il lavoro verrà assegnato a un'altra azienda.")
+                bot.send_message(chat_id=CONFIRMATION_GROUP_ID, text=f"⛔ Nessuna risposta dal gruppo <code>{gruppo_id}</code>. Lavoro riassegnato.", parse_mode=telegram.ParseMode.HTML)
+            except Exception as e:
+                print(f"Errore invio messaggio finale a {gruppo_id}: {e}")
+            del reminder_cache[key]
+        elif ora - primo_invio >= (count + 1) * SOLLECITO_INTERVAL:
+            gruppo_id, preventivo_id = key.split("_")
+            link = generate_share_link(preventivo_id)
+            try:
+                bot.send_message(chat_id=int(gruppo_id), text=f"🔔 <b>Gentile collaboratore, ti ricordiamo il preventivo ancora da confermare:</b>\n{link}", parse_mode=telegram.ParseMode.HTML)
+                reminder_cache[key][1] += 1
+                print(f"🔁 Sollecito inviato a gruppo {gruppo_id}")
+            except Exception as e:
+                print(f"Errore sollecito a gruppo {gruppo_id}: {e}")
+
 def scan_and_send():
     root_id = get_folder_id_by_name(FOLDER_NAME)
     if not root_id:
-        print("❌ Cartella principale non trovata.")
+        print("❌ Cartella PreventiviTelegram non trovata.")
         return
 
     gruppi = get_subfolders(root_id)
@@ -76,79 +111,40 @@ def scan_and_send():
 
         for p in preventivi:
             key = f"{gruppo_id}_{p['id']}"
-            if key in confirmed_cache:
+            if key in sent_cache:
                 continue
+            link = generate_share_link(p['id'])
+            invia_preventivo(gruppo_id, p['name'], link, key)
 
-            if key not in sent_cache:
-                link = generate_share_link(p['id'])
-                nome_file = p['name']
-                messaggio = f"\U0001F4C2 <b>Nuovo preventivo disponibile:</b>\n<b>{nome_file}</b>\n{link}"
+def conferma(update, context):
+    msg = update.message
+    testo = msg.text.lower()
+    if testo in ["ok", "confermo", "va bene", "accetto"]:
+        gruppo_id = msg.chat.id
+        user = msg.from_user.full_name
+        for key in reminder_cache:
+            if str(gruppo_id) in key:
+                confirmed_cache.add(key)
                 try:
-                    bot.send_message(chat_id=gruppo_id, text=messaggio, parse_mode=telegram.ParseMode.HTML)
-                    bot.send_message(chat_id=CONFIRMATION_GROUP_ID, text=f"\u2705 Inviato a <code>{gruppo_id}</code>: {nome_file}", parse_mode=telegram.ParseMode.HTML)
-                    sent_cache[key] = {
-                        "nome_file": nome_file,
-                        "gruppo_id": gruppo_id,
-                        "first_sent": datetime.now(),
-                        "last_reminder": datetime.now(),
-                        "reminders": 0
-                    }
+                    bot.send_message(chat_id=CONFIRMATION_GROUP_ID, text=f"✅ Conferma ricevuta da <b>{user}</b> nel gruppo <code>{gruppo_id}</code>", parse_mode=telegram.ParseMode.HTML)
+                    print(f"✅ Conferma registrata per {gruppo_id} da {user}")
                 except Exception as e:
-                    print(f"❌ Errore invio gruppo {gruppo_id}: {e}")
-
-# === SOLLECITI ===
-def invia_solleciti():
-    now = datetime.now()
-    for key, data in list(sent_cache.items()):
-        if key in confirmed_cache:
-            continue
-
-        elapsed = now - data['last_reminder']
-        total_time = now - data['first_sent']
-
-        if total_time.total_seconds() > SOLLECITO_MAX_HOURS * 3600:
-            try:
-                bot.send_message(chat_id=data['gruppo_id'], text="❌ Tempo scaduto: inoltreremo il lavoro ad un'altra azienda.")
-                bot.send_message(chat_id=CONFIRMATION_GROUP_ID, text=f"⚠️ Nessuna risposta dal gruppo <code>{data['gruppo_id']}</code> per il preventivo: {data['nome_file']}.", parse_mode=telegram.ParseMode.HTML)
-                confirmed_cache.add(key)
-            except:
-                pass
-            continue
-
-        if elapsed.total_seconds() >= SOLLECITO_INTERVAL:
-            try:
-                bot.send_message(chat_id=data['gruppo_id'], text=f"🔔 Sollecito: confermi il preventivo <b>{data['nome_file']}</b>?", parse_mode=telegram.ParseMode.HTML)
-                data['last_reminder'] = now
-                data['reminders'] += 1
-            except:
-                pass
-
-# === GESTIONE CONFERME ===
-def handle_update(update):
-    if not update.message:
-        return
-
-    text = update.message.text.lower()
-    if text in ["ok", "confermo", "va bene", "accetto"]:
-        user_id = update.message.chat.id
-        for key, data in sent_cache.items():
-            if data['gruppo_id'] == user_id and key not in confirmed_cache:
-                confirmed_cache.add(key)
-                bot.send_message(chat_id=CONFIRMATION_GROUP_ID, text=f"✅ Conferma ricevuta da gruppo <code>{user_id}</code> per il preventivo <b>{data['nome_file']}</b>.", parse_mode=telegram.ParseMode.HTML)
+                    print(f"Errore invio conferma: {e}")
                 break
 
-# === AVVIO ===
-if __name__ == '__main__':
-    print("🚀 BOT avviato e operativo.")
-    updater = telegram.ext.Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    dp.add_handler(telegram.ext.MessageHandler(telegram.ext.Filters.text & ~telegram.ext.Filters.command, handle_update))
-    updater.start_polling()
+from telegram.ext import Updater, MessageHandler, Filters
+updater = Updater(token=BOT_TOKEN, use_context=True)
+dp = updater.dispatcher
+dp.add_handler(MessageHandler(Filters.text & (~Filters.command), conferma))
+updater.start_polling()
 
+if __name__ == '__main__':
+    print("🚀 BOT preventivi avviato...")
     while True:
         try:
             scan_and_send()
-            invia_solleciti()
+            invia_sollecito()
         except Exception as e:
-            print(f"❌ Errore generale:\n{traceback.format_exc()}")
+            print(f"❌ Errore:
+{traceback.format_exc()}")
         time.sleep(CHECK_INTERVAL)
