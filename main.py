@@ -289,6 +289,10 @@ def scan_and_send():
 
 
 def invia_sollecito():
+    """
+    Invia solleciti e messaggio finale.
+    Adesso include NOME PREVENTIVO e LINK sia nei promemoria che nel messaggio di chiusura.
+    """
     now = time.time()
 
     with lock:
@@ -296,7 +300,7 @@ def invia_sollecito():
 
     changed = False
 
-    for key, info in items:
+    for key, _ in items:
         gruppo_id, _folder_id = key
 
         with lock:
@@ -311,16 +315,27 @@ def invia_sollecito():
             t0 = info["t0"]
             count = info["count"]
             link = info["link"]
+            nome = info.get("nome", "preventivo")
 
+        # Messaggio finale dopo tutti i solleciti
         if count >= SOLLECITO_MAX:
             try:
                 bot.send_message(
                     chat_id=gruppo_id,
-                    text="❌ Ci dispiace che tu non abbia risposto. Il lavoro verrà assegnato a un'altra azienda."
+                    text=(
+                        "❌ Non abbiamo ricevuto conferma per il preventivo "
+                        f"<b>{escape(nome)}</b>.\n"
+                        "Il lavoro verrà assegnato a un'altra azienda.\n"
+                        f"{escape(link)}"
+                    ),
+                    parse_mode="HTML",
                 )
                 bot.send_message(
                     chat_id=CONFIRMATION_GROUP_ID,
-                    text=f"⛔ Nessuna risposta dal gruppo <code>{gruppo_id}</code>. Lavoro riassegnato.",
+                    text=(
+                        f"⛔ Nessuna risposta dal gruppo <code>{gruppo_id}</code> "
+                        f"per il preventivo <b>{escape(nome)}</b>. Lavoro riassegnato."
+                    ),
                     parse_mode="HTML",
                 )
             except Exception as e:
@@ -332,18 +347,23 @@ def invia_sollecito():
             changed = True
             continue
 
+        # Solleciti intermedi
         if now - t0 >= (count + 1) * SOLLECITO_INTERVAL:
             try:
                 bot.send_message(
                     chat_id=gruppo_id,
-                    text=f"🔔 <b>Promemoria: preventivo da confermare</b>\n{escape(link)}",
+                    text=(
+                        "🔔 <b>Promemoria: preventivo da confermare</b>\n"
+                        f"<b>{escape(nome)}</b>\n"
+                        f"{escape(link)}"
+                    ),
                     parse_mode="HTML",
                 )
                 with lock:
                     if key in reminder_cache:
                         reminder_cache[key]["count"] += 1
                 changed = True
-                print(f"🔁 Sollecito → gruppo {gruppo_id}")
+                print(f"🔁 Sollecito → gruppo {gruppo_id} per {nome}")
             except Exception as e:
                 print(f"Errore sollecito a {gruppo_id}: {e}")
 
